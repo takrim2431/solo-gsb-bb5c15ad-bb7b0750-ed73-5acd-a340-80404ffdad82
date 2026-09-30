@@ -105,6 +105,40 @@ class SubmitOut(BaseModel):
     event_id: int
 
 
+class RestoreIn(BaseModel):
+    """复供预演 / 确认入参：按隔离事件编号与当前管网版本操作。"""
+
+    version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
+class ReopenBlockOut(BaseModel):
+    code: str
+    message: str
+    pipe_id: str | None = None
+    reachable_endpoints: list[str] = []
+
+
+class RestorePreviewOut(BaseModel):
+    version: int
+    version_match: bool
+    event_id: int
+    status: str
+    fault_pipe_id: str
+    closed_pipe_ids: list[str]
+    safe: bool
+    restored_sink_ids: list[str]
+    block_reasons: list[ReopenBlockOut]
+
+
+class RestoreOut(BaseModel):
+    version: int
+    event_id: int
+    status: str
+    fault_pipe_id: str
+    reopened_pipe_ids: list[str]
+    restored_sink_ids: list[str]
+
+
 class EventOut(BaseModel):
     id: int
     version_before: int
@@ -112,4 +146,6 @@ class EventOut(BaseModel):
     fault_pipe_id: str
     closed_pipe_ids: list[str]
     affected_sink_ids: list[str]
+    status: str = "open"
+    restored_at: datetime | None = None
     created_at: datetime

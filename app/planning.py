@@ -1,12 +1,19 @@
-"""管网故障隔离的纯领域逻辑（不依赖数据库 / Web 框架）。
+"""管网故障隔离与复供的纯领域逻辑（不依赖数据库 / Web 框架）。
 
 规则概述：
 - 管网为无向图，节点分为水源(source)/用水点(sink)/连接点(junction)。
 - 已关闭阀门的管段视为不可通行。
+- 其他“待修复(open)”隔离事件的故障管段同样视为不可通行（故障仍在，不能通水）。
 - 方案图 = 当前管网移除故障管段，再移除/关闭所有“拟关闭管段”，
-  同时已关闭阀门继续保持关闭。
+  同时已关闭阀门、其他待修复故障管段继续保持阻断。
 - 只有故障管段**两端**在方案图中都无法从任一水源到达，方案才可隔离(isolatable)。
 - 失供用水点 = 方案前由任一水源可达、方案后不可达的 sink，按编号排序。
+
+复供（restore）规则：
+- 复供图 = 当前管网重新打开本事件关闭的阀门（从“仍关闭阀门”集合中剔除），
+  再继续移除“其他待修复事件”的故障管段。
+- 仅当重开后，其余每条待修复故障管段的**两端**都仍无法从水源到达，才允许复供。
+- 预计恢复供水用水点 = 复供前不可达、复供图中可达的 sink，按编号排序。
 """
 from __future__ import annotations
 
@@ -21,6 +28,8 @@ CLOSE_PIPE_NOT_FOUND = "CLOSE_PIPE_NOT_FOUND"
 CLOSE_PIPE_NO_VALVE = "CLOSE_PIPE_NO_VALVE"
 CLOSE_PIPE_DUPLICATE = "CLOSE_PIPE_DUPLICATE"
 CLOSE_PIPE_IS_FAULT = "CLOSE_PIPE_IS_FAULT"
+# 复供阻断：重开阀门后其他待修复故障管段有一端重新进水
+FAULT_REWATER_RISK = "FAULT_REWATER_RISK"
 # 导入期问题
 DUPLICATE_NODE_ID = "DUPLICATE_NODE_ID"
 DUPLICATE_PIPE_ID = "DUPLICATE_PIPE_ID"
@@ -72,7 +81,35 @@ class PlanResult:
     isolatable: bool
     affected_sink_ids: list[str]
     issues: list[Issue] = field(default_factory=list)
-    # 方案中实际被阻断的管段（已关 ∪ 拟关，故障管段单独移除）
+    # 方案中实际被阻断的管段（已关 ∪ 拟关 ∪ 待修复故障，故障管段单独移除）
+    blocked_pipe_ids: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass
+class ReopenBlock:
+    """复供阻断原因：某条其他待修复故障管段在重开阀门后有一端重新进水。"""
+
+    fault_pipe_id: str
+    reachable_endpoints: list[str]
+
+    def as_dict(self) -> dict:
+        return {
+            "code": FAULT_REWATER_RISK,
+            "message": (
+                f"重开阀门后，待修复故障管段 {self.fault_pipe_id} 的 "
+                f"{ '、'.join(self.reachable_endpoints) } 端将重新进水，禁止复供"
+            ),
+            "pipe_id": self.fault_pipe_id,
+            "reachable_endpoints": list(self.reachable_endpoints),
+        }
+
+
+@dataclass
+class RestoreResult:
+    safe: bool
+    restored_sink_ids: list[str]
+    blocks: list[ReopenBlock] = field(default_factory=list)
+    # 复供评估中仍不可通行的管段（其他待修复故障管段 ∪ 仍关闭阀门）
     blocked_pipe_ids: frozenset[str] = field(default_factory=frozenset)
 
 
@@ -213,11 +250,15 @@ def evaluate_plan(
     close_pipe_ids: list[str],
     *,
     for_submit: bool = False,
+    pending_fault_pipe_ids: frozenset[str] = frozenset(),
 ) -> PlanResult:
     """评估隔离方案。
 
     预演(for_submit=False)：只做结构校验，已关闭阀门不会产生“重复关闭”问题；
     提交(for_submit=True)：对已关闭阀门再次关闭视为 CLOSE_PIPE_DUPLICATE。
+
+    pending_fault_pipe_ids：其他“待修复”隔离事件的故障管段编号集合，
+    无论方案前/方案后都视为不可通行（故障未修复，不能通水）。
     """
     issues = validate_plan_request(
         pipes, fault_pipe_id, close_pipe_ids, for_submit=for_submit
@@ -232,13 +273,15 @@ def evaluate_plan(
         )
 
     pipe_list = list(pipes.values())
+    pending_faults = frozenset(pid for pid in pending_fault_pipe_ids if pid in pipes)
 
-    # 方案前（当前态）：仅已关闭阀门不可通行，故障管段尚未移除
+    # 方案前（当前态）：已关闭阀门、其他待修复故障管段不可通行，本次故障尚未移除
     already_closed = frozenset(p.id for p in pipe_list if p.has_valve and p.valve_closed)
-    before_reachable = _reachable(nodes, pipe_list, already_closed)
+    base_removed = already_closed | pending_faults
+    before_reachable = _reachable(nodes, pipe_list, base_removed)
 
-    # 方案后：故障管段移除；已关阀门继续生效；拟关阀门全部关闭
-    blocked = already_closed | frozenset(close_pipe_ids)
+    # 方案后：故障管段移除；已关阀门、其他待修复故障继续生效；拟关阀门全部关闭
+    blocked = base_removed | frozenset(close_pipe_ids)
     after_removed = blocked | frozenset({fault_pipe_id})
     after_reachable = _reachable(nodes, pipe_list, after_removed)
 
@@ -258,4 +301,62 @@ def evaluate_plan(
         affected_sink_ids=affected,
         issues=issues,
         blocked_pipe_ids=frozenset(blocked),
+    )
+
+
+# ---------------------------------------------------------------- 复供评估
+
+
+def evaluate_restore(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    reopen_pipe_ids: frozenset[str],
+    other_fault_pipe_ids: frozenset[str],
+) -> RestoreResult:
+    """评估复供安全性（只读，不改任何状态）。
+
+    - reopen_pipe_ids：本事件提交时关闭的阀门管段，复供后重新通水；
+    - other_fault_pipe_ids：其他“待修复”事件的故障管段，继续视为不可通行。
+
+    仅当其余待修复故障管段的两端在复供图中仍均不可从水源到达，safe=True。
+    预计恢复供水用水点 = 复供前不可达、复供后可达的 sink。
+    """
+    pipe_list = list(pipes.values())
+    already_closed = frozenset(p.id for p in pipe_list if p.has_valve and p.valve_closed)
+    other_faults = frozenset(
+        pid for pid in other_fault_pipe_ids if pid in pipes
+    )
+
+    # 复供前（当前态）：仍关闭阀门 + 其他待修复故障管段不可通行
+    before_removed = already_closed | other_faults
+    before_reachable = _reachable(nodes, pipe_list, before_removed)
+
+    # 复供后：本事件阀门重开（从阻断集合剔除）；其他待修复故障仍然阻断
+    after_removed = (already_closed - frozenset(reopen_pipe_ids)) | other_faults
+    after_reachable = _reachable(nodes, pipe_list, after_removed)
+
+    blocks: list[ReopenBlock] = []
+    for fid in sorted(other_faults):
+        fault = pipes[fid]
+        reachable_ends = [
+            end
+            for end in (fault.from_node, fault.to_node)
+            if end in after_reachable
+        ]
+        if reachable_ends:
+            blocks.append(
+                ReopenBlock(fault_pipe_id=fid, reachable_endpoints=reachable_ends)
+            )
+
+    restored = sorted(
+        nid
+        for nid, node in nodes.items()
+        if node.type == "sink" and nid not in before_reachable and nid in after_reachable
+    )
+
+    return RestoreResult(
+        safe=not blocks,
+        restored_sink_ids=restored,
+        blocks=blocks,
+        blocked_pipe_ids=frozenset(after_removed),
     )

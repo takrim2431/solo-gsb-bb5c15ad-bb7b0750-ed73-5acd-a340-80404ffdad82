@@ -52,9 +52,32 @@ CREATE TABLE IF NOT EXISTS isolation_events (
     fault_pipe_id     TEXT NOT NULL,
     closed_pipe_ids   JSONB NOT NULL,
     affected_sink_ids JSONB NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'restored')),
+    restored_at       TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 兼容旧库：建表后补齐状态列（整网替换会清空事件，旧事件随替换失效）
+ALTER TABLE isolation_events
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+ALTER TABLE isolation_events
+    ADD COLUMN IF NOT EXISTS restored_at TIMESTAMPTZ;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'isolation_events_status_check'
+    ) THEN
+        ALTER TABLE isolation_events
+            ADD CONSTRAINT isolation_events_status_check
+            CHECK (status IN ('open', 'restored'));
+    END IF;
+END$$;
 """
+
+# 事件状态：待修复 / 已复供
+EVENT_OPEN = "open"
+EVENT_RESTORED = "restored"
 
 
 @contextmanager
@@ -207,14 +230,15 @@ def submit_isolation(
         cur.execute(
             "INSERT INTO isolation_events "
             "(version_before, version_after, fault_pipe_id, "
-            " closed_pipe_ids, affected_sink_ids) "
-            "VALUES (%s, %s, %s, %s::jsonb, %s::jsonb) RETURNING id, created_at",
+            " closed_pipe_ids, affected_sink_ids, status) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s) RETURNING id, created_at",
             (
                 current_version,
                 new_version,
                 fault_pipe_id,
                 json.dumps(close_pipe_ids),
                 json.dumps(result.affected_sink_ids),
+                EVENT_OPEN,
             ),
         )
         event_id, created_at = cur.fetchone()
@@ -233,37 +257,118 @@ class VersionConflict(Exception):
         super().__init__(f"版本过期：当前版本 {current}，提交基于版本 {expected}")
 
 
+# ---------------------------------------------------------------- 复供
+
+
+def _decode_jsonb(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _serialize_event_row(r: dict) -> dict:
+    return {
+        "id": r["id"],
+        "version_before": r["version_before"],
+        "version_after": r["version_after"],
+        "fault_pipe_id": r["fault_pipe_id"],
+        "closed_pipe_ids": _decode_jsonb(r["closed_pipe_ids"]),
+        "affected_sink_ids": _decode_jsonb(r["affected_sink_ids"]),
+        "status": r["status"],
+        "restored_at": r.get("restored_at"),
+        "created_at": r["created_at"],
+    }
+
+
+_EVENT_COLUMNS = (
+    "id, version_before, version_after, fault_pipe_id, "
+    "closed_pipe_ids, affected_sink_ids, status, restored_at, created_at"
+)
+
+
+def get_event(conn, event_id: int, *, for_update: bool = False) -> dict | None:
+    """按编号读取隔离事件；for_update=True 时锁定事件行。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events WHERE id = %s"
+            f"{' FOR UPDATE' if for_update else ''}",
+            (event_id,),
+        )
+        row = cur.fetchone()
+    return _serialize_event_row(row) if row else None
+
+
+def list_open_events(conn, *, exclude_event_id: int | None = None,
+                     for_update: bool = False) -> list[dict]:
+    """读取全部待修复(status=open)事件；可排除指定事件（即正在复供的事件）。"""
+    sql = f"SELECT {_EVENT_COLUMNS} FROM isolation_events WHERE status = %s"
+    params: list = [EVENT_OPEN]
+    if exclude_event_id is not None:
+        sql += " AND id <> %s"
+        params.append(exclude_event_id)
+    sql += " ORDER BY id"
+    if for_update:
+        sql += " FOR UPDATE"
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return [_serialize_event_row(r) for r in rows]
+
+
+def confirm_restore(
+    conn,
+    event_id: int,
+    expected_version: int,
+    reopened_pipe_ids: list[str],
+    restored_sink_ids: list[str],
+) -> dict:
+    """在已开启的事务内完成复供确认。
+
+    调用方须已锁定事件行与版本行，并基于当前快照完成安全性复核。
+    本函数只负责：版本复核 → 重开阀门 → 版本 +1 → 事件置为已复供，原子生效。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        if reopened_pipe_ids:
+            cur.execute(
+                "UPDATE pipes SET valve_closed = FALSE "
+                "WHERE id = ANY(%s) AND has_valve = TRUE",
+                (reopened_pipe_ids,),
+            )
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+        cur.execute(
+            "UPDATE isolation_events "
+            "SET status = %s, restored_at = now() "
+            "WHERE id = %s AND status = %s",
+            (EVENT_RESTORED, event_id, EVENT_OPEN),
+        )
+        if cur.rowcount != 1:  # 并发下事件已被复供：拒绝且不产生部分变更
+            raise RuntimeError(f"隔离事件 {event_id} 已复供或不存在")
+        cur.execute("SELECT restored_at FROM isolation_events WHERE id = %s", (event_id,))
+        restored_at = cur.fetchone()[0]
+
+    return {
+        "version": new_version,
+        "restored_at": restored_at,
+    }
+
+
 # ---------------------------------------------------------------- 历史
 
 
 def list_events(conn, limit: int) -> list[dict]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "SELECT id, version_before, version_after, fault_pipe_id, "
-            "closed_pipe_ids, affected_sink_ids, created_at "
+            f"SELECT {_EVENT_COLUMNS} "
             "FROM isolation_events ORDER BY id DESC LIMIT %s",
             (limit,),
         )
         rows = cur.fetchall()
-
-    events = []
-    for r in rows:
-        closed = r["closed_pipe_ids"]
-        affected = r["affected_sink_ids"]
-        # 防御：某些驱动配置下 jsonb 可能返回字符串
-        if isinstance(closed, str):
-            closed = json.loads(closed)
-        if isinstance(affected, str):
-            affected = json.loads(affected)
-        events.append(
-            {
-                "id": r["id"],
-                "version_before": r["version_before"],
-                "version_after": r["version_after"],
-                "fault_pipe_id": r["fault_pipe_id"],
-                "closed_pipe_ids": closed,
-                "affected_sink_ids": affected,
-                "created_at": r["created_at"],
-            }
-        )
-    return events
+    return [_serialize_event_row(r) for r in rows]

@@ -12,6 +12,7 @@ from app.planning import (  # noqa: E402
     Node,
     Pipe,
     evaluate_plan,
+    evaluate_restore,
     validate_import,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
@@ -23,6 +24,7 @@ from app.planning import (  # noqa: E402
     CLOSE_PIPE_NO_VALVE,
     CLOSE_PIPE_DUPLICATE,
     CLOSE_PIPE_IS_FAULT,
+    FAULT_REWATER_RISK,
 )
 
 
@@ -188,6 +190,103 @@ class IsolationPlanTests(unittest.TestCase):
         result = evaluate_plan(nodes, pipes, "P2", [])
         self.assertFalse(result.isolatable)
         self.assertEqual(result.affected_sink_ids, [])
+
+    def test_pending_fault_pipes_are_blocked_in_plan(self):
+        # 待修复事件的故障管段在方案前后均视为不可通行：
+        # 其下游用水点方案前已失供，不计入本次 affected
+        nodes, pipes = build_demo()
+        # P6（D-U3）已是另一条待修复事件的故障管段
+        result = evaluate_plan(
+            nodes,
+            pipes,
+            "P5",                      # 本次故障 B-U2
+            ["P5"],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertFalse(result.isolatable)  # B 仍从 P2 进水
+        self.assertNotIn("U3", result.affected_sink_ids)
+
+
+def build_restore_demo():
+    """复供演示管网：
+
+    S --P1(v)-- A --P2(v)-- B --P4(v,关)-- D --P6(无阀)-- U3
+                 |                    |
+               P3(v)                P7(无阀)
+                 |                    |
+                 U1            P8(v,开) -- E -- U4
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "D": Node("D", "junction"),
+        "E": Node("E", "junction"),
+        "U1": Node("U1", "sink"),
+        "U3": Node("U3", "sink"),
+        "U4": Node("U4", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A", has_valve=True),
+        "P2": Pipe("P2", "A", "B", has_valve=True),
+        "P3": Pipe("P3", "A", "U1", has_valve=True),
+        "P4": Pipe("P4", "B", "D", has_valve=True, valve_closed=True),
+        "P6": Pipe("P6", "D", "U3", has_valve=False),
+        "P7": Pipe("P7", "D", "E", has_valve=False),
+        "P8": Pipe("P8", "E", "U4", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class RestorePlanningTests(unittest.TestCase):
+    def test_safe_restore_when_other_faults_stay_isolated(self):
+        nodes, pipes = build_restore_demo()
+        # 片区内事件（未关阀）复供：重开集合为空，仍关的 P4 保护故障 P6
+        result = evaluate_restore(
+            nodes, pipes, reopen_pipe_ids=frozenset(),
+            other_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertTrue(result.safe)
+        self.assertEqual(result.restored_sink_ids, [])
+        self.assertEqual(result.blocks, [])
+
+    def test_unsafe_restore_when_pending_fault_end_gets_water(self):
+        nodes, pipes = build_restore_demo()
+        # 外层事件（关 P4）复供，而片区内 P7 仍待修复：D 端重新进水
+        result = evaluate_restore(
+            nodes, pipes, reopen_pipe_ids=frozenset({"P4"}),
+            other_fault_pipe_ids=frozenset({"P7"}),
+        )
+        self.assertFalse(result.safe)
+        self.assertEqual(len(result.blocks), 1)
+        block = result.blocks[0]
+        self.assertEqual(block.fault_pipe_id, "P7")
+        self.assertEqual(block.reachable_endpoints, ["D"])
+        self.assertEqual(block.as_dict()["code"], FAULT_REWATER_RISK)
+        # U3 恢复；U4 因 P7 自身阻断仍不可达
+        self.assertEqual(result.restored_sink_ids, ["U3"])
+
+    def test_restore_becomes_safe_after_inner_event_restored(self):
+        nodes, pipes = build_restore_demo()
+        # 没有其他待修复故障时，重开 P4，U3/U4 同时恢复
+        result = evaluate_restore(
+            nodes, pipes, reopen_pipe_ids=frozenset({"P4"}),
+            other_fault_pipe_ids=frozenset(),
+        )
+        self.assertTrue(result.safe)
+        self.assertEqual(result.restored_sink_ids, ["U3", "U4"])
+
+    def test_other_closed_valves_keep_effect(self):
+        # 复供只重开本事件阀门；另一事件关闭的 P2 继续生效
+        nodes, pipes = build_restore_demo()
+        pipes["P2"] = Pipe("P2", "A", "B", has_valve=True, valve_closed=True)
+        result = evaluate_restore(
+            nodes, pipes, reopen_pipe_ids=frozenset({"P4"}),
+            other_fault_pipe_ids=frozenset(),
+        )
+        # P2 关闭时 B/D 侧整体仍无水，U3/U4 不会恢复，但也无风险
+        self.assertTrue(result.safe)
+        self.assertEqual(result.restored_sink_ids, [])
 
 
 if __name__ == "__main__":
