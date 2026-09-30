@@ -5,6 +5,7 @@
 运行：python3 -m unittest tests.test_api -v
 （需要 fastapi/httpx 依赖）
 """
+import datetime
 import json
 import os
 import sys
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.planning import Node, Pipe  # noqa: E402
+from app.planning import Node, Pipe, RepairEvent  # noqa: E402
 
 
 class FakeStore:
@@ -86,7 +87,7 @@ def fake_replace_network(conn, nodes, pipes):
 
 
 def fake_submit_isolation(conn, expected_version, fault_pipe_id, close_pipe_ids, result):
-    # 复制 db.submit_isolation 的关键语义：锁行版本比对 -> 更新阀位 -> +1 -> 事件
+    # 复制 db.submit_isolation 的关键语义：锁行版本比对 -> 更新阀位 -> +1 -> 事件(待修复)
     if STORE.version != expected_version:
         raise db.VersionConflict(STORE.version, expected_version)
     for pid in close_pipe_ids:
@@ -107,10 +108,49 @@ def fake_submit_isolation(conn, expected_version, fault_pipe_id, close_pipe_ids,
         "fault_pipe_id": fault_pipe_id,
         "closed_pipe_ids": list(close_pipe_ids),
         "affected_sink_ids": list(result.affected_sink_ids),
+        "status": "pending_repair",
+        "restored_at": None,
+        "restore_version": None,
         "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
     }
     STORE.events.insert(0, event)
     return {"version": STORE.version, "event_id": eid, "created_at": event["created_at"]}
+
+
+def fake_load_repair_events(conn, status=None):
+    out = {}
+    for e in STORE.events:
+        if status is not None and e["status"] != status:
+            continue
+        out[e["id"]] = RepairEvent(
+            id=e["id"],
+            status=e["status"],
+            fault_pipe_id=e["fault_pipe_id"],
+            closed_pipe_ids=tuple(e["closed_pipe_ids"]),
+        )
+    return out
+
+
+def fake_confirm_restoration(conn, expected_version, event_id, reopen_pipe_ids):
+    # 复制 db.confirm_restoration 的关键语义：版本比对 -> 事件状态复核 ->
+    # 重开阀门 -> 事件置已复供 -> 版本 +1
+    if STORE.version != expected_version:
+        raise db.VersionConflict(STORE.version, expected_version)
+    event = next((e for e in STORE.events if e["id"] == event_id), None)
+    if event is None:
+        raise db.EventNotFound(event_id)
+    if event["status"] == "restored":
+        raise db.EventAlreadyRestored(event_id)
+    for pid in reopen_pipe_ids:
+        p = STORE.pipes[pid]
+        STORE.pipes[pid] = Pipe(
+            p.id, p.from_node, p.to_node, p.has_valve, False, p.name
+        )
+    STORE.version += 1
+    event["status"] = "restored"
+    event["restored_at"] = datetime.datetime(2026, 9, 30, 13, 0, 0)
+    event["restore_version"] = STORE.version
+    return {"version": STORE.version, "event_id": event_id}
 
 
 def fake_list_events(conn, limit):
@@ -124,6 +164,8 @@ db.init_db = fake_init_db
 db.load_snapshot = fake_load_snapshot
 db.replace_network = fake_replace_network
 db.submit_isolation = fake_submit_isolation
+db.load_repair_events = fake_load_repair_events
+db.confirm_restoration = fake_confirm_restoration
 db.list_events = fake_list_events
 
 
@@ -385,6 +427,214 @@ class ApiTests(unittest.TestCase):
             )
         self.assertEqual(STORE.version, 1)
         self.assertFalse(STORE.pipes["P4"].valve_closed)
+
+
+TWO_FAULT_NETWORK = {
+    "nodes": [
+        {"id": "S", "type": "source"},
+        {"id": "A", "type": "junction"},
+        {"id": "B", "type": "junction"},
+        {"id": "D", "type": "junction"},
+        {"id": "E", "type": "junction"},
+        {"id": "U2", "type": "sink"},
+        {"id": "U3", "type": "sink"},
+        {"id": "U4", "type": "sink"},
+    ],
+    "pipes": [
+        {"id": "P1", "from": "S", "to": "A", "has_valve": True},
+        {"id": "P2", "from": "A", "to": "B", "has_valve": True},
+        {"id": "P4", "from": "B", "to": "D", "has_valve": True},
+        {"id": "P5", "from": "B", "to": "U2", "has_valve": True},
+        {"id": "P6", "from": "D", "to": "U3", "has_valve": True},
+        {"id": "P8", "from": "D", "to": "E", "has_valve": True},
+        {"id": "P9", "from": "E", "to": "U4", "has_valve": True},
+    ],
+}
+
+
+class RestorationApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.fail_commit = False
+
+    def _import(self):
+        r = self.client.post("/api/network/import", json=TWO_FAULT_NETWORK)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _submit_two_events(self):
+        # e1：故障 P6，关 P4（版本 1 -> 2）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        e1 = r.json()["event_id"]
+        self.assertEqual(r.json()["event_status"], "pending_repair")
+        # e2：P4 已关，故障 P9 无需再关阀即可隔离（版本 2 -> 3）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P9", "close_pipe_ids": [], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        e2 = r.json()["event_id"]
+        return e1, e2
+
+    def test_preview_does_not_change_state(self):
+        self._import()
+        e1, _ = self._submit_two_events()
+        r = self.client.post(
+            "/api/isolation/restore/preview",
+            json={"event_id": e1, "version": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["safe"])
+        self.assertEqual(body["issues"][0]["code"], "RESTORE_UNSAFE")
+        self.assertEqual(body["issues"][0]["pipe_id"], "P9")
+        self.assertEqual(body["issues"][0]["node_id"], "E")
+        self.assertEqual(body["reopen_pipe_ids"], ["P4"])
+        self.assertEqual(body["restored_sink_ids"], ["U3"])
+        # 预演不改状态
+        self.assertEqual(STORE.version, 3)
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+
+    def test_confirm_outer_event_unsafe_rejected_no_partial_change(self):
+        self._import()
+        e1, _ = self._submit_two_events()
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e1, "version": 3},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["error"]["code"], "RESTORE_UNSAFE")
+        # 无部分变更：阀门仍关、版本不变、事件仍待修复
+        self.assertEqual(STORE.version, 3)
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+        self.assertEqual(STORE.events[1]["status"], "pending_repair")
+
+    def test_restore_in_order_then_history_and_valves(self):
+        self._import()
+        e1, e2 = self._submit_two_events()
+
+        # 先复供 e2（内层）：无阀门重开，安全
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e2, "version": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 4)
+        self.assertEqual(body["event_status"], "restored")
+        self.assertEqual(body["reopened_pipe_ids"], [])
+        self.assertEqual(body["restored_sink_ids"], [])
+        self.assertTrue(STORE.pipes["P4"].valve_closed)
+
+        # 再复供 e1：重开 P4，U3、U4 同时恢复
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e1, "version": 4},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 5)
+        self.assertEqual(body["reopened_pipe_ids"], ["P4"])
+        self.assertEqual(body["restored_sink_ids"], ["U3", "U4"])
+        self.assertFalse(STORE.pipes["P4"].valve_closed)
+
+        # 历史接口包含状态字段，按 id 倒序
+        r = self.client.get("/api/isolation/events")
+        events = r.json()
+        self.assertEqual([e["id"] for e in events], [e2, e1])
+        self.assertTrue(all(e["status"] == "restored" for e in events))
+        self.assertEqual(events[1]["restore_version"], 5)
+        self.assertEqual(events[0]["restore_version"], 4)
+
+    def test_restore_version_conflict(self):
+        self._import()
+        e1, _ = self._submit_two_events()
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e1, "version": 99},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+        self.assertEqual(STORE.version, 3)
+
+    def test_restore_event_not_found(self):
+        self._import()
+        r = self.client.post(
+            "/api/isolation/restore/preview",
+            json={"event_id": 42, "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["issues"][0]["code"], "EVENT_NOT_FOUND")
+        # confirm 直接 404
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": 42, "version": 1},
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+
+    def test_restore_already_restored(self):
+        self._import()
+        e1, e2 = self._submit_two_events()
+        # 安全顺序先复供 e2
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e2, "version": 3},
+        )
+        self.assertEqual(r.status_code, 200)
+        # 再确认一次 -> 409
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e2, "version": 4},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "EVENT_ALREADY_RESTORED")
+        # 预演同样给出已复供问题
+        r = self.client.post(
+            "/api/isolation/restore/preview",
+            json={"event_id": e2, "version": 4},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["safe"])
+        self.assertEqual(r.json()["issues"][0]["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_old_events_invalid_after_reimport(self):
+        self._import()
+        e1, _ = self._submit_two_events()
+        # 整网替换 -> 旧事件失效
+        r = self.client.post("/api/network/import", json=VALID_NETWORK)
+        self.assertEqual(r.status_code, 200)
+        r = self.client.post(
+            "/api/isolation/restore/confirm",
+            json={"event_id": e1, "version": 1},
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+
+    def test_isolation_preview_counts_pending_fault(self):
+        self._import()
+        # 提交 e1 后，P6 作为待修复故障管段持续断管
+        self._submit_two_events()
+        # 对 P6 再做预演：无拟关阀门也因待修复而“可隔离”，且不重复计失供
+        r = self.client.post(
+            "/api/isolation/preview",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": [], "version": 3},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["isolatable"])
+        self.assertEqual(body["affected_sink_ids"], [])
 
 
 if __name__ == "__main__":

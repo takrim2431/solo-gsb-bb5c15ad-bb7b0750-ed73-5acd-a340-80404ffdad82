@@ -11,7 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.planning import (  # noqa: E402
     Node,
     Pipe,
+    RepairEvent,
     evaluate_plan,
+    evaluate_restoration,
     validate_import,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
@@ -23,6 +25,11 @@ from app.planning import (  # noqa: E402
     CLOSE_PIPE_NO_VALVE,
     CLOSE_PIPE_DUPLICATE,
     CLOSE_PIPE_IS_FAULT,
+    EVENT_NOT_FOUND,
+    EVENT_ALREADY_RESTORED,
+    RESTORE_UNSAFE,
+    STATUS_PENDING_REPAIR,
+    STATUS_RESTORED,
 )
 
 
@@ -188,6 +195,168 @@ class IsolationPlanTests(unittest.TestCase):
         result = evaluate_plan(nodes, pipes, "P2", [])
         self.assertFalse(result.isolatable)
         self.assertEqual(result.affected_sink_ids, [])
+
+
+def build_two_fault_network():
+    """两段故障的管网（e1: P6/D-U3；e2: P9/E-U4，共用 D 点支路）：
+
+    S -P1(v)- A -P2(v)- B -P4(v)- D -P6(v)- U3
+                        |            \
+                      P5(v)          P8(v)- E -P9(v)- U4
+                        |
+                       U2
+    e1 提交：故障 P6，关 P4；e2 在 P4 已关后提交：故障 P9，无需再关阀
+    （D-E-U4 整条支路因 P4 关闭而与水源断开）。
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "D": Node("D", "junction"),
+        "E": Node("E", "junction"),
+        "U2": Node("U2", "sink"),
+        "U3": Node("U3", "sink"),
+        "U4": Node("U4", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A", has_valve=True),
+        "P2": Pipe("P2", "A", "B", has_valve=True),
+        "P4": Pipe("P4", "B", "D", has_valve=True),
+        "P5": Pipe("P5", "B", "U2", has_valve=True),
+        "P6": Pipe("P6", "D", "U3", has_valve=True),
+        "P8": Pipe("P8", "D", "E", has_valve=True),
+        "P9": Pipe("P9", "E", "U4", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class PendingFaultPlanTests(unittest.TestCase):
+    def test_pending_fault_pipe_excluded_from_water_path(self):
+        # 待修复事件的故障管段 P4 已断管：故障 P6 即使不补关阀门也可隔离
+        nodes, pipes = build_demo()
+        result = evaluate_plan(
+            nodes, pipes, "P6", [], pending_fault_pipe_ids=frozenset({"P4"})
+        )
+        self.assertTrue(result.isolatable)
+        # U3 在方案前就因 P4 断管失供，不重复计入
+        self.assertEqual(result.affected_sink_ids, [])
+
+    def test_pending_fault_sink_not_counted_again(self):
+        # 待修复故障 P5（B-U2）：U2 方案前已失供，只统计本次新增的 U3
+        nodes, pipes = build_demo()
+        result = evaluate_plan(
+            nodes, pipes, "P6", ["P4"], pending_fault_pipe_ids=frozenset({"P5"})
+        )
+        self.assertTrue(result.isolatable)
+        self.assertEqual(result.affected_sink_ids, ["U3"])
+
+    def test_isolatable_when_other_event_already_closed_branch(self):
+        # 对应 e2 的提交场景：P4 已关、P6 待修复，故障 P9 无需关阀即可隔离
+        nodes, pipes = build_two_fault_network()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        result = evaluate_plan(
+            nodes,
+            pipes,
+            "P9",
+            [],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertTrue(result.isolatable)
+        self.assertEqual(result.affected_sink_ids, [])
+
+
+class RestorationTests(unittest.TestCase):
+    def test_restore_single_event_safe(self):
+        nodes, pipes = build_demo()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_PENDING_REPAIR, "P6", ("P4",)),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 1)
+        self.assertTrue(result.safe, result.issues)
+        self.assertEqual(result.event_pipe_ids, ["P4"])
+        self.assertEqual(result.reopen_pipe_ids, ["P4"])
+        self.assertEqual(result.stay_closed_pipe_ids, [])
+        self.assertEqual(result.restored_sink_ids, ["U3"])
+        self.assertEqual(result.issues, [])
+
+    def test_restore_outer_event_first_is_unsafe(self):
+        # 先复供 e1（重开 P4）会让 e2 的故障管段 P9 的 E 端重新进水
+        nodes, pipes = build_two_fault_network()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_PENDING_REPAIR, "P6", ("P4",)),
+            2: RepairEvent(2, STATUS_PENDING_REPAIR, "P9", ()),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 1)
+        self.assertFalse(result.safe)
+        codes = [i.code for i in result.issues]
+        self.assertEqual(codes, [RESTORE_UNSAFE])
+        self.assertEqual(result.issues[0].pipe_id, "P9")
+        self.assertEqual(result.issues[0].node_id, "E")
+        # 预演仍给出预计恢复用水点，但不允许确认
+        self.assertEqual(result.restored_sink_ids, ["U3"])
+        self.assertEqual(result.reopen_pipe_ids, ["P4"])
+
+    def test_restore_inner_event_first_safe(self):
+        # 先复供 e2：没有阀门要重开，且 e1 的故障管段 P6 两端仍不可达
+        nodes, pipes = build_two_fault_network()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_PENDING_REPAIR, "P6", ("P4",)),
+            2: RepairEvent(2, STATUS_PENDING_REPAIR, "P9", ()),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 2)
+        self.assertTrue(result.safe, result.issues)
+        self.assertEqual(result.reopen_pipe_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+
+    def test_restore_after_inner_restored_brings_both_sinks_back(self):
+        # e2 已复供后再复供 e1：U3、U4 同时恢复，按编号排序
+        nodes, pipes = build_two_fault_network()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_PENDING_REPAIR, "P6", ("P4",)),
+            2: RepairEvent(2, STATUS_RESTORED, "P9", ()),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 1)
+        self.assertTrue(result.safe, result.issues)
+        self.assertEqual(result.reopen_pipe_ids, ["P4"])
+        self.assertEqual(result.restored_sink_ids, ["U3", "U4"])
+
+    def test_restore_valve_held_by_other_event_stays_closed(self):
+        # P4 同时被两个事件占用：复供 e1 时 P4 必须保持关闭
+        nodes, pipes = build_two_fault_network()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        pipes["P8"] = Pipe("P8", "D", "E", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_PENDING_REPAIR, "P6", ("P4",)),
+            2: RepairEvent(2, STATUS_PENDING_REPAIR, "P9", ("P4", "P8")),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 1)
+        self.assertTrue(result.safe, result.issues)
+        self.assertEqual(result.reopen_pipe_ids, [])
+        self.assertEqual(result.stay_closed_pipe_ids, ["P4", "P8"])
+        # P4 不开，U3 仍失供
+        self.assertEqual(result.restored_sink_ids, [])
+
+    def test_restore_event_not_found(self):
+        nodes, pipes = build_demo()
+        result = evaluate_restoration(nodes, pipes, {}, 99)
+        self.assertFalse(result.safe)
+        self.assertIsNone(result.status)
+        self.assertEqual(result.issues[0].code, EVENT_NOT_FOUND)
+
+    def test_restore_already_restored(self):
+        nodes, pipes = build_demo()
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        events = {
+            1: RepairEvent(1, STATUS_RESTORED, "P6", ("P4",)),
+        }
+        result = evaluate_restoration(nodes, pipes, events, 1)
+        self.assertFalse(result.safe)
+        self.assertEqual(result.issues[0].code, EVENT_ALREADY_RESTORED)
+        self.assertEqual(result.event_pipe_ids, ["P4"])
 
 
 if __name__ == "__main__":

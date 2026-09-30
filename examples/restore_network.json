@@ -1,0 +1,21 @@
+{
+  "nodes": [
+    {"id": "S",  "type": "source",   "name": "二水厂"},
+    {"id": "A",  "type": "junction"},
+    {"id": "B",  "type": "junction"},
+    {"id": "D",  "type": "junction"},
+    {"id": "E",  "type": "junction"},
+    {"id": "U2", "type": "sink",     "name": "人民医院"},
+    {"id": "U3", "type": "sink",     "name": "东郊工业园"},
+    {"id": "U4", "type": "sink",     "name": "临港物流园"}
+  ],
+  "pipes": [
+    {"id": "P1", "from": "S", "to": "A", "has_valve": true},
+    {"id": "P2", "from": "A", "to": "B", "has_valve": true},
+    {"id": "P4", "from": "B", "to": "D", "has_valve": true},
+    {"id": "P5", "from": "B", "to": "U2", "has_valve": true},
+    {"id": "P6", "from": "D", "to": "U3", "has_valve": true, "name": "故障管段1"},
+    {"id": "P8", "from": "D", "to": "E", "has_valve": true},
+    {"id": "P9", "from": "E", "to": "U4", "has_valve": true, "name": "故障管段2"}
+  ]
+}
